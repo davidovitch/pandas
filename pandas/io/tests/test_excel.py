@@ -1,7 +1,7 @@
 # pylint: disable=E1101
 
 from pandas.compat import u, range, map, openpyxl_compat, BytesIO, iteritems
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 import sys
 import os
 from distutils.version import LooseVersion
@@ -56,6 +56,13 @@ def _skip_if_no_xlsxwriter():
         import xlsxwriter  # NOQA
     except ImportError:
         raise nose.SkipTest('xlsxwriter not installed, skipping')
+
+
+def _skip_if_no_ezodf():
+    try:
+        import ezodf  # NOQA
+    except ImportError:
+        raise nose.SkipTest('ezodf not installed, skipping')
 
 
 def _skip_if_no_excelsuite():
@@ -269,9 +276,13 @@ class ReadingTestsBase(SharedItems):
         tm.assert_frame_equal(df3, df1.ix[:-1])
         tm.assert_frame_equal(df3, df4)
 
-        import xlrd
-        with tm.assertRaises(xlrd.XLRDError):
-            read_excel(excel, 'asdf')
+        if self.ext == '.ods':
+            with tm.assertRaises(KeyError):
+                read_excel(excel, 'asdf')
+        else:
+            import xlrd
+            with tm.assertRaises(xlrd.XLRDError):
+                read_excel(excel, 'asdf')
 
     def test_excel_table(self):
 
@@ -402,6 +413,10 @@ class ReadingTestsBase(SharedItems):
 
     # GH 12292 : error when read one empty column from excel file
     def test_read_one_empty_col_no_header(self):
+
+        if self.ext == '.ods':
+            raise nose.SkipTest('no ods reader implemented, skipping')
+
         df = pd.DataFrame(
             [["", 1, 100],
              ["", 2, 200],
@@ -428,6 +443,10 @@ class ReadingTestsBase(SharedItems):
         tm.assert_frame_equal(actual_header_zero, expected)
 
     def test_read_one_empty_col_with_header(self):
+
+        if self.ext == '.ods':
+            raise nose.SkipTest('no ods reader implemented, skipping')
+
         _skip_if_no_xlwt()
         _skip_if_no_openpyxl()
 
@@ -458,6 +477,10 @@ class ReadingTestsBase(SharedItems):
         tm.assert_frame_equal(actual_header_zero, expected_header_zero)
 
     def test_set_column_names_in_parameter(self):
+
+        if self.ext == '.ods':
+            raise nose.SkipTest('no ods writer implemented, skipping')
+
         # GH 12870 : pass down column names associated with
         # keyword argument names
         refdf = pd.DataFrame([[1, 'foo'], [2, 'bar'],
@@ -489,6 +512,58 @@ class ReadingTestsBase(SharedItems):
 
         result = self.get_exceldf('testdateoverflow')
         tm.assert_frame_equal(result, expected)
+
+
+class OdsReaderTests(ReadingTestsBase, tm.TestCase):
+    ext = '.ods'
+    engine_name = 'ezodf'
+    check_skip = staticmethod(_skip_if_no_ezodf)
+
+    def test_read_ezodf_book(self):
+
+        import ezodf
+        pth = os.path.join(self.dirpath, 'test1' + self.ext)
+        book = ezodf.opendoc(pth)
+        result1 = ExcelFile(book).parse()
+        result2 = read_excel(book)
+
+        df = read_excel(pth)
+        tm.assert_frame_equal(df, result1)
+        tm.assert_frame_equal(df, result2)
+
+    def test_types_datetime(self):
+
+        expected = DataFrame.from_items([
+            ("UnicodeCol", ['øø', 'ææ', 'åå', 'oø', '€£$¥', '£@$', 'ÅøØæÆ@']),
+            ("ExpCol", [8.50E-010, 8.50E+012, 9.00E-055, 8.50E+011, 8.5E-10,
+                        5E-10, 5E-10]),
+            ("BoolCol", [True, False, True, True, False, False, False]),
+            ("TimeCol", [time(hour=23, microsecond=1),
+                         time(hour=2),
+                         time(hour=1, minute=1, second=1),
+                         timedelta(days=1, hours=2, minutes=1, seconds=1,
+                                   microseconds=1),
+                         timedelta(hours=866, minutes=1, seconds=1,
+                                   microseconds=1),
+                         time(2, 59, 40, 500000),
+                         time(23, 59, 59, 100)]),
+            ("DateTimeCol", [datetime(2014, 10, 10, 10),
+                             datetime(1900, 2, 1, 2),
+                             datetime(2014, 1, 1, 23, 15, 15),
+                             datetime(2011, 2, 3, 4, 5, 6),
+                             datetime(1900, 7, 8, 9, 0, 1),
+                             datetime(2015, 5, 7, 9, 33, 23),
+                             datetime(2015, 5, 7, 2, 33, 23, 300000)]),
+            ("DateCol", [datetime(2014,3,2), datetime(1900,2,1),
+                         datetime(1899,12,30), datetime(2100,12,11),
+                         datetime(1850,11,3), datetime(2950,11,3),
+                         datetime(2015,7,6)]),
+            ("TimeInDateFormat", [datetime(1899,12,30,1) for k in range(7)])
+        ])
+
+        pth = os.path.join(self.dirpath, 'test_types_datetime' + self.ext)
+        dfs = read_excel(pth)
+        tm.assert_frame_equal(dfs, expected)
 
 
 class XlrdTests(ReadingTestsBase):
