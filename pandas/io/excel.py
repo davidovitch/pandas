@@ -4,9 +4,11 @@ Module parse to/from Excel
 
 # ---------------------------------------------------------------------
 # ExcelFile class
-from datetime import datetime, date, time, MINYEAR
+from __future__ import print_function
+from datetime import datetime, date, time, timedelta, MINYEAR
 
 import os
+import re
 import abc
 import numpy as np
 
@@ -30,6 +32,8 @@ __all__ = ["read_excel", "ExcelWriter", "ExcelFile"]
 
 _writer_extensions = ["xlsx", "xls", "xlsm"]
 _writers = {}
+_readers = {}
+_reader_extensions = {}
 
 
 def register_writer(klass):
@@ -72,18 +76,189 @@ def get_writer(engine_name):
         raise ValueError("No Excel writer '%s'" % engine_name)
 
 
+class BaseFile(object):
+    """Base class for excel readers
+
+    A file class can be initialized even if the engine is not installed.
+    If the engine is not installed, io_class and workbook_factory are None.
+    When attempting to use open_workbook while workbook_factory is None, the
+    relevant ImportError is raised.
+    """
+
+    def __init__(self):
+        """Set the engine name, and extension. If the engine is not installed,
+        io_class and workbook_factory are both None.
+        """
+        self.io_class = None
+        self.workbook_factory = None
+
+    def open_workbook(self, *args, **kwargs):
+        """Explicitely load the engine again (and trigger an ImportError in the
+        process) if workbook_factory is set to None.
+        """
+        # try to load the engine again and raise import error if required
+        if self.workbook_factory is None:
+            self.load_engine()
+        # just in case the user passes an already opened workbook of io_class
+        if len(args) > 0 and isinstance(args[0], self.io_class):
+            self.book = args[0]
+        else:
+            self.book = self.workbook_factory(*args, **kwargs)
+        return self.book
+
+    def create_reader(self, io, engine=None):
+        """Create the appropriate reader object based on io and optionally
+        engine.
+
+        Paratemeters
+        ------------
+        io : string, file-like object or xlrd/ezodf workbook
+            If a string, expected to be a path to xls, xlsx, or ods file.
+            File-like objects or buffers are only supported for xlrd types.
+
+        engine: string, default None
+            If io is not a buffer or path, this must be set to identify io.
+            Acceptable values are None, xlrd, or ezodf
+
+        Returns
+        -------
+        engine : string
+            Engine used for reading the io
+
+        book : object
+            The spreadsheet book class created by the engine.
+        """
+
+        # file is already opened with ExcelFile, and passed on as io here
+        # meaning this is the second time we're going through here
+        if isinstance(io, ExcelFile):
+            return io.reader
+
+        # If io is a url, want to keep the data as bytes so can't pass
+        # to get_filepath_or_buffer()
+        if _is_url(io):
+            io = _urlopen(io)
+        # Deal with S3 urls, path objects, etc. Will convert them to
+        # buffer or path string
+        io, _, _ = get_filepath_or_buffer(io)
+
+        if engine is not None:
+            try:
+                reader = _readers[engine]
+            except KeyError:
+                msg = 'Excel reader engine "%s" is not implemented' % engine
+                raise NotImplementedError(msg)
+            # load_engine throws the relevant import error if not installed
+            reader.load_engine()
+            reader.open_workbook(io)
+            return reader
+        elif isinstance(io, compat.string_types):
+            ext = io.split('.')[-1]
+            try:
+                reader = _reader_extensions[ext]
+            except KeyError:
+                msg = 'No reader implemented for extension "%s"' % ext
+                raise NotImplementedError(msg)
+            reader.load_engine()
+            reader.open_workbook(io)
+            return reader
+
+        # try to determine the reader type based on properties of installed
+        # reader modules.
+        for engine, reader in compat.iteritems(_readers):
+            # only try to import readers that have not been imported before
+            if reader.io_class is None:
+                try:
+                    reader.load_engine()
+                # if the reader is not installed, the user could not have
+                # passed the corresponding reader.io_class, so it is safe
+                # to assume that io is not the current reader
+                except ImportError:
+                    continue
+            # Does the io type match the currently selected reader?
+            if isinstance(io, reader.io_class):
+                reader.engine = engine
+                reader.book = io
+                return reader
+            # xlrd has some additional/alternative reading mechanisms:
+            elif engine=='xlrd' and hasattr(io, "read"):
+                # N.B. xlrd.Book has a read attribute too
+                reader.read_buffer(io.read())
+                return reader
+
+        raise ValueError('Must explicitly set engine if not passing in buffer '
+                         'or path for io.')
+
+
+class XLRDFile(BaseFile):
+    """File reader class for MS Excel spreadsheets (depends on xlrd)
+    """
+    extensions = ['xls', 'xlsx', 'xlsm']
+    engine = 'xlrd'
+
+    def load_engine(self):
+        import xlrd  # throw an ImportError if we need to
+        ver = tuple(map(int, xlrd.__VERSION__.split(".")[:2]))
+        if ver < (0, 9):  # pragma: no cover
+            raise ImportError("pandas requires xlrd >= 0.9.0 for excel "
+                              "support, current version " + xlrd.__VERSION__)
+        else:
+            self.workbook_factory = xlrd.open_workbook
+            self.io_class = xlrd.Book
+
+    def read_buffer(self, data):
+        """Read from a buffer
+        """
+        return self.open_workbook(file_contents=data)
+
+
+class EZODFFile(BaseFile):
+    """File reader class for ODF spreadsheets (depends on ezodf)
+    """
+    extensions = ['ods']
+    engine = 'ezodf'
+
+    def load_engine(self):
+        import ezodf # throw an ImportError if we need to
+        self.workbook_factory = ezodf.opendoc
+        self.io_class = ezodf.document.PackagedDocument
+
+    def read_buffer(self, *args, **kwargs):
+        """
+        """
+        msg = 'Can not read ODF spreadsheet from a buffer or URL.'
+        raise NotImplementedError(msg)
+
+
+# register all supported readers
+def register_readers():
+    """
+    Establish which readers are supported and/or installed.
+    """
+
+    def populate(reader):
+        _readers[reader.engine] = reader
+        for ext in reader.extensions:
+            _reader_extensions[ext] = reader
+
+    populate(XLRDFile())
+    populate(EZODFFile())
+
+register_readers()
+
+
 def read_excel(io, sheetname=0, header=0, skiprows=None, skip_footer=0,
                index_col=None, names=None, parse_cols=None, parse_dates=False,
                date_parser=None, na_values=None, thousands=None,
                convert_float=True, has_index_names=None, converters=None,
                engine=None, squeeze=False, **kwds):
     """
-    Read an Excel table into a pandas DataFrame
+    Read an Excel/ODF table into a pandas DataFrame
 
     Parameters
     ----------
     io : string, path object (pathlib.Path or py._path.local.LocalPath),
-        file-like object, pandas ExcelFile, or xlrd workbook.
+        file-like object, pandas ExcelFile, or xlrd/ezodf workbook.
         The string could be a URL. Valid URL schemes include http, ftp, s3,
         and file. For file URLs, a host is expected. For instance, a local
         file could be file://localhost/path/to/workbook.xlsx
@@ -126,7 +301,7 @@ def read_excel(io, sheetname=0, header=0, skiprows=None, skip_footer=0,
     converters : dict, default None
         Dict of functions for converting values in certain columns. Keys can
         either be integers or column labels, values are functions that take one
-        input argument, the Excel cell content, and return the transformed
+        input argument, the Excel/ods cell content, and return the transformed
         content.
     parse_cols : int or list, default None
         * If None then parse all columns,
@@ -150,10 +325,10 @@ def read_excel(io, sheetname=0, header=0, skiprows=None, skip_footer=0,
         Indicate number of NA values placed in non-numeric columns
     engine: string, default None
         If io is not a buffer or path, this must be set to identify io.
-        Acceptable values are None or xlrd
+        Acceptable values are None, xlrd, or ezodf
     convert_float : boolean, default True
         convert integral floats to int (i.e., 1.0 --> 1). If False, all numeric
-        data will be read in as floats: Excel stores all numbers as floats
+        data will be read in as floats: Excel/ods stores all numbers as floats
         internally
     has_index_names : boolean, default None
         DEPRECATED: for version 0.17+ index names will be automatically
@@ -166,10 +341,9 @@ def read_excel(io, sheetname=0, header=0, skiprows=None, skip_footer=0,
         DataFrame from the passed in Excel file.  See notes in sheetname
         argument for more information on when a Dict of Dataframes is returned.
     """
-    if not isinstance(io, ExcelFile):
-        io = ExcelFile(io, engine=engine)
+    engine = kwds.pop('engine', None)
 
-    return io._parse_excel(
+    return ExcelFile(io, engine=engine).parse(
         sheetname=sheetname, header=header, skiprows=skiprows, names=names,
         index_col=index_col, parse_cols=parse_cols, parse_dates=parse_dates,
         date_parser=date_parser, na_values=na_values, thousands=thousands,
@@ -181,53 +355,23 @@ def read_excel(io, sheetname=0, header=0, skiprows=None, skip_footer=0,
 class ExcelFile(object):
     """
     Class for parsing tabular excel sheets into DataFrame objects.
-    Uses xlrd. See read_excel for more documentation
+    Uses xlrd and/or ezodf. See read_excel for more documentation
 
     Parameters
     ----------
     io : string, path object (pathlib.Path or py._path.local.LocalPath),
-        file-like object or xlrd workbook
+        file-like object or xlrd/ezodf workbook
         If a string or path object, expected to be a path to xls or xlsx file
     engine: string, default None
         If io is not a buffer or path, this must be set to identify io.
-        Acceptable values are None or xlrd
+        Acceptable values are None, xlrd, or ezodf
     """
 
     def __init__(self, io, **kwds):
-
-        import xlrd  # throw an ImportError if we need to
-
-        ver = tuple(map(int, xlrd.__VERSION__.split(".")[:2]))
-        if ver < (0, 9):  # pragma: no cover
-            raise ImportError("pandas requires xlrd >= 0.9.0 for excel "
-                              "support, current version " + xlrd.__VERSION__)
-
         self.io = io
 
         engine = kwds.pop('engine', None)
-
-        if engine is not None and engine != 'xlrd':
-            raise ValueError("Unknown engine: %s" % engine)
-
-        # If io is a url, want to keep the data as bytes so can't pass
-        # to get_filepath_or_buffer()
-        if _is_url(io):
-            io = _urlopen(io)
-        # Deal with S3 urls, path objects, etc. Will convert them to
-        # buffer or path string
-        io, _, _ = get_filepath_or_buffer(io)
-
-        if engine == 'xlrd' and isinstance(io, xlrd.Book):
-            self.book = io
-        elif not isinstance(io, xlrd.Book) and hasattr(io, "read"):
-            # N.B. xlrd.Book has a read attribute too
-            data = io.read()
-            self.book = xlrd.open_workbook(file_contents=data)
-        elif isinstance(io, compat.string_types):
-            self.book = xlrd.open_workbook(io)
-        else:
-            raise ValueError('Must explicitly set engine if not passing in'
-                             ' buffer or path for io.')
+        self.reader = BaseFile().create_reader(io, engine=engine)
 
     def parse(self, sheetname=0, header=0, skiprows=None, skip_footer=0,
               names=None, index_col=None, parse_cols=None, parse_dates=False,
@@ -241,19 +385,26 @@ class ExcelFile(object):
         docstring for more info on accepted parameters
         """
 
-        return self._parse_excel(sheetname=sheetname, header=header,
-                                 skiprows=skiprows, names=names,
-                                 index_col=index_col,
-                                 has_index_names=has_index_names,
-                                 parse_cols=parse_cols,
-                                 parse_dates=parse_dates,
-                                 date_parser=date_parser, na_values=na_values,
-                                 thousands=thousands,
-                                 skip_footer=skip_footer,
-                                 convert_float=convert_float,
-                                 converters=converters,
-                                 squeeze=squeeze,
-                                 **kwds)
+        if self.reader.engine == 'ezodf':
+            parser = self._parse_ods
+        elif self.reader.engine == 'xlrd':
+            parser = self._parse_excel
+        else:
+            raise ValueError('Engine is not specified.')
+
+        return parser(sheetname=sheetname, header=header,
+                      skiprows=skiprows, names=names,
+                      index_col=index_col,
+                      has_index_names=has_index_names,
+                      parse_cols=parse_cols,
+                      parse_dates=parse_dates,
+                      date_parser=date_parser, na_values=na_values,
+                      thousands=thousands,
+                      skip_footer=skip_footer,
+                      convert_float=convert_float,
+                      converters=converters,
+                      squeeze=squeeze,
+                      **kwds)
 
     def _should_parse(self, i, parse_cols):
 
@@ -304,7 +455,7 @@ class ExcelFile(object):
                  "will be automatically inferred based on index_col.\n"
                  "This argmument is still necessary if reading Excel output "
                  "from 0.16.2 or prior with index names.", FutureWarning,
-                 stacklevel=3)
+                 stacklevel=4)
 
         if 'chunksize' in kwds:
             raise NotImplementedError("chunksize keyword of read_excel "
@@ -322,7 +473,7 @@ class ExcelFile(object):
                           XL_CELL_ERROR, XL_CELL_BOOLEAN,
                           XL_CELL_NUMBER)
 
-        epoch1904 = self.book.datemode
+        epoch1904 = self.reader.book.datemode
 
         def _parse_cell(cell_contents, cell_typ):
             """converts the contents of the cell into a pandas
@@ -401,9 +552,9 @@ class ExcelFile(object):
                 print("Reading sheet %s" % asheetname)
 
             if isinstance(asheetname, compat.string_types):
-                sheet = self.book.sheet_by_name(asheetname)
+                sheet = self.reader.book.sheet_by_name(asheetname)
             else:  # assume an integer if not a string
-                sheet = self.book.sheet_by_index(asheetname)
+                sheet = self.reader.book.sheet_by_index(asheetname)
 
             data = []
             should_parse = {}
@@ -490,9 +641,203 @@ class ExcelFile(object):
         else:
             return output[asheetname]
 
+    def _parse_ods(self, sheetname=0, header=0, skiprows=None, skip_footer=0,
+                   index_col=None, has_index_names=None, parse_cols=None,
+                   parse_dates=False, date_parser=None, na_values=None,
+                   thousands=None, chunksize=None, convert_float=True,
+                   verbose=False, **kwds):
+        # adds support for parsing ODS files, see PR #9070
+
+        skipfooter = kwds.pop('skipfooter', None)
+        if skipfooter is not None:
+            skip_footer = skipfooter
+
+        def _parse_cell(cell):
+            """converts the contents of the cell into a pandas
+               appropriate object"""
+            if isinstance(cell.value, float):
+                value = cell.value
+                if convert_float:
+                    # GH5394 - Excel and ODS 'numbers' are always floats
+                    # it's a minimal perf hit and less suprising
+                    # FIXME: this goes wrong when int(cell.value) returns
+                    # a long (>1e18)
+                    val = int(cell.value)
+                    if val == cell.value:
+                        value = val
+            elif isinstance(cell.value, compat.string_types):
+                typ = cell.value_type
+                if typ == 'date' or typ == 'time':
+                    value = self._parse_datetime(cell)
+                else:
+                    value = cell.value
+            elif isinstance(cell.value, bool):
+                value = cell.value
+            # empty cells have None as value, type, currency, formula.
+            # xlrd assigns empty string to empty cells, ezodf assigns None
+            # test_excel.ExcelReaderTests.test_reader_converters expects empty
+            # cells to be an empty string
+            elif isinstance(cell.value, type(None)):
+                value = ''
+            else:
+                value = np.nan
+            return value
+
+        ret_dict = False
+        # find numbers for the date/time object conversion
+        self.regex = re.compile('[[0-9]*[\\.[0-9]+]*]*')
+
+        # Keep sheetname to maintain backwards compatibility.
+        if isinstance(sheetname, list):
+            sheets = sheetname
+            ret_dict = True
+        elif sheetname is None:
+            sheets = self.sheet_names
+            ret_dict = True
+        else:
+            sheets = [sheetname]
+
+        # handle same-type duplicates.
+        sheets = list(set(sheets))
+
+        output = {}
+
+        for asheetname in sheets:
+            if verbose:
+                print("Reading sheet %s" % asheetname)
+
+            # sheetname can be index or string
+            sheet = self.reader.book.sheets[asheetname]
+
+            data = []
+            should_parse = {}
+            for i in range(sheet.nrows()):
+                row = []
+                for j, cell in enumerate(sheet.row(i)):
+
+                    if parse_cols is not None and j not in should_parse:
+                        should_parse[j] = self._should_parse(j, parse_cols)
+
+                    if parse_cols is None or should_parse[j]:
+                        row.append(_parse_cell(cell))
+
+                data.append(row)
+
+            # ezodf returns one empty string cell for a blank sheet
+            if sheet.nrows() == 0 or (sheet.nrows() == 1 and data[0] == ['']):
+                output[asheetname] = DataFrame()
+                continue
+
+            parser = TextParser(data, header=header, index_col=index_col,
+                                has_index_names=has_index_names,
+                                na_values=na_values,
+                                thousands=thousands,
+                                parse_dates=parse_dates,
+                                date_parser=date_parser,
+                                skiprows=skiprows,
+                                skip_footer=skip_footer,
+                                chunksize=chunksize,
+                                **kwds)
+            output[asheetname] = parser.read()
+
+        if ret_dict:
+            return output
+        else:
+            return output[asheetname]
+
+    def _parse_datetime(self, cell):
+        """Parse the date or time from on ods cell to a datetime object.
+        Formats returned by ezodf are documented here:
+        https://pythonhosted.org/ezodf/tableobjects.html#cell-class
+
+        Because time cells can also be timedeltas, all time fields that exceed
+        23 hours are converted to a timedelta object.
+
+        Date string value formats: 'yyyy-mm-dd' or 'yyyy-mm-ddThh:mm:ss'
+
+        Time string value format: 'PThhHmmMss,ffffS'
+        """
+
+        def _sec_split_micro(seconds):
+            """Split a floatingpoint second value into an integer second value
+            and an integer microsecond value.
+            """
+            sec = float(seconds)
+            sec_i = int(sec)
+            microsec = int(round((sec - sec_i)*1e6, 0))
+            return sec_i, microsec
+
+        def _timedelta(items):
+            """
+            Possible formats for formulas are:
+                'of:=TIME(%H;%M;%S)'
+                'of:=TIME(%H;%M;%S.%fS)'
+            Possible formats for values are:
+                'PT%HH%MM%S.%fS'
+                'PT%HH%MM%SS'
+            """
+            hours, minutes, seconds = items
+            return timedelta(hours=int(hours), minutes=int(minutes),
+                             seconds=float(seconds))
+
+        def _time(items):
+            hours, minutes, seconds = items
+            sec_i, microsec = _sec_split_micro(seconds)
+            return time(int(hours), int(minutes), sec_i, microsec)
+
+        def _datetime(items):
+            """
+            Possible formats for values are:
+                '%Y-%m-%d'
+                '%Y-%m-%dT%H:%M:%S'
+                '%Y-%m-%dT%H:%M:%S.%f'
+            """
+
+            if len(items) == 3:
+                year, month, day = [int(k) for k in items]
+                return datetime(year, month, day)
+            else:
+                year, month, day, hours, minutes = [int(k) for k in items[:-1]]
+                # seconds can be a float, convert to microseconds
+                sec, micsec = _sec_split_micro(items[-1])
+                return datetime(year, month, day, hours, minutes, sec, micsec)
+
+        # Only consider the value fields, formula's can contain just cell refs.
+        # Note that cell formatting determines if a value type is time, date or
+        # just a number. By using the cell value, cell type is consistent with
+        # what the user will see/format in LibreOffice
+        items = self.regex.findall(cell.value)
+        if cell.value_type == 'date':
+            value = _datetime(items)
+        else:
+            try:
+                # will fail when hours > 23, which is possible in LibreOffice
+                value = _time(items)
+            except ValueError:
+                value = _timedelta(items)
+
+        return value
+
+    def _print_ods_cellinfo(self, cell):
+        """Convienent for debugging purposes: print all ods cell data.
+        Cell attributes are documented here:
+        https://pythonhosted.org/ezodf/tableobjects.html#id2
+        """
+        print('   plaintext:', cell.plaintext())  # no formatting
+        # formatted, but what is difference with value?
+        print('display_form:', cell.display_form)  # format, ?=plaintext
+        print('       value:', cell.value)       # data handled
+        print('  value_type:', cell.value_type)  # data type
+        print('     formula:', cell.formula)
+        print('    currency:', cell.currency)
+
     @property
     def sheet_names(self):
-        return self.book.sheet_names()
+        if self.reader.engine == 'ezodf':
+            # book.sheet.names() is a generator for ezodf
+            return [sheetname for sheetname in self.reader.book.sheets.names()]
+        else:
+            return self.reader.book.sheet_names()
 
     def close(self):
         """close io if necessary"""
